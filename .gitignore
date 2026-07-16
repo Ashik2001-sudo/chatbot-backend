@@ -4,11 +4,6 @@ node_modules/
 # build
 dist/
 
-# env & secrets
-.env
-.env.local
-.env.*.local
-
 # runtime data
 uploads/
 sessions/
