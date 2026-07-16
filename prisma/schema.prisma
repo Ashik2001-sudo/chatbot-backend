@@ -1,0 +1,175 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  owner
+  admin
+  agent
+}
+
+enum ChannelType {
+  WHATSAPP_BAILEYS
+  WHATSAPP_CLOUD
+  FACEBOOK_PAGE
+  INSTAGRAM
+}
+
+enum ChannelStatus {
+  connected
+  disconnected
+  pending_qr
+}
+
+enum ConversationStatus {
+  open
+  pending
+  resolved
+}
+
+enum MessageDirection {
+  inbound
+  outbound
+}
+
+enum MessageContentType {
+  text
+  image
+  audio
+  document
+  video
+}
+
+enum MessageStatus {
+  sent
+  delivered
+  read
+  failed
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users              User[]
+  channelConnections ChannelConnection[]
+  contacts           Contact[]
+  conversations      Conversation[]
+}
+
+model User {
+  id        String   @id @default(cuid())
+  tenantId  String
+  email     String
+  password  String
+  name      String
+  role      UserRole @default(agent)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant              Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignedConversations Conversation[] @relation("AssignedConversations")
+  sentMessages        Message[]      @relation("SentMessages")
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+}
+
+model ChannelConnection {
+  id          String        @id @default(cuid())
+  tenantId    String
+  type        ChannelType
+  name        String
+  status      ChannelStatus @default(disconnected)
+  credentials Json          @default("{}")
+  externalId  String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@index([tenantId])
+  @@index([externalId])
+}
+
+model Contact {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String?
+  phone       String?
+  avatarUrl   String?  @db.Text
+  externalIds Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@index([tenantId])
+}
+
+model Conversation {
+  id            String             @id @default(cuid())
+  tenantId      String
+  contactId     String
+  channelType   ChannelType
+  channelConnId String
+  status        ConversationStatus @default(open)
+  assignedToId  String?
+  lastMessageAt DateTime           @default(now())
+  unreadCount   Int                @default(0)
+  readOnly      Boolean            @default(false)
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  tenant        Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact       Contact           @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  channelConn   ChannelConnection @relation(fields: [channelConnId], references: [id], onDelete: Cascade)
+  assignedTo    User?             @relation("AssignedConversations", fields: [assignedToId], references: [id], onDelete: SetNull)
+  messages      Message[]
+
+  @@index([tenantId])
+  @@index([contactId])
+  @@index([assignedToId])
+  @@index([lastMessageAt])
+}
+
+model Message {
+  id             String             @id @default(cuid())
+  conversationId String
+  direction      MessageDirection
+  contentType    MessageContentType @default(text)
+  body           String?            @db.Text
+  mediaUrl       String?
+  externalId     String?
+  sentById       String?
+  status         MessageStatus      @default(sent)
+  createdAt      DateTime           @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sentBy       User?        @relation("SentMessages", fields: [sentById], references: [id], onDelete: SetNull)
+
+  @@index([conversationId])
+  @@index([createdAt])
+}
+
+model BaileysSession {
+  id        String   @id @default(cuid())
+  channelId String   @unique
+  tenantId  String
+  creds     Json     @default("{}")
+  keys      Json     @default("{}")
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+}
