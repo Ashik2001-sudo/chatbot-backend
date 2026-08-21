@@ -12,12 +12,32 @@ async function bootstrap() {
   if (!existsSync(uploadDir)) mkdirSync(uploadDir, { recursive: true });
   app.useStaticAssets(uploadDir, { prefix: '/uploads/' });
 
-  const corsOrigins = (
-    process.env.CORS_ORIGINS ?? 'http://localhost:3001'
-  ).split(',');
+  const corsOrigins = new Set(
+    (process.env.CORS_ORIGINS ?? 'http://localhost:3001,https://chatbot.doozi.bd')
+      .split(',')
+      .map((o) => o.trim())
+      .filter(Boolean),
+  );
 
   app.enableCors({
-    origin: corsOrigins.map((o) => o.trim()),
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (corsOrigins.has(origin)) return callback(null, true);
+      try {
+        const { hostname } = new URL(origin);
+        if (
+          hostname === 'localhost' ||
+          hostname === '127.0.0.1' ||
+          hostname === 'doozi.bd' ||
+          hostname.endsWith('.doozi.bd')
+        ) {
+          return callback(null, true);
+        }
+      } catch {
+        /* ignore invalid origin */
+      }
+      callback(null, false);
+    },
     credentials: true,
   });
 
