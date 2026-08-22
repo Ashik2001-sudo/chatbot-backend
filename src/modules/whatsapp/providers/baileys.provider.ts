@@ -162,6 +162,15 @@ export class BaileysProvider {
     return existsSync(join(process.cwd(), 'sessions', channelId, 'creds.json'));
   }
 
+  private disconnectStatusCode(
+    lastDisconnect: { error?: Boom | Error } | undefined,
+  ): number | undefined {
+    const err = lastDisconnect?.error as
+      | (Boom & { status?: number })
+      | undefined;
+    return err?.output?.statusCode ?? err?.status;
+  }
+
   async setHistorySyncDecision(channelId: string, enabled: boolean) {
     const handler = this.historyDecisionHandlers.get(channelId);
     if (!handler) {
@@ -243,7 +252,6 @@ export class BaileysProvider {
       ...(version ? { version } : {}),
       browser: Browsers.ubuntu('Chrome'),
       auth: state,
-      printQRInTerminal: false,
       // Ask the phone for full chat history when the device is (re)linked.
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
@@ -284,13 +292,23 @@ export class BaileysProvider {
         // skip the status update and never reconnect.
         if (this.stopped.delete(channelId)) return;
 
-        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const statusCode = this.disconnectStatusCode(lastDisconnect);
+        this.logger.log(
+          `Baileys closed ${channelId} (code ${statusCode ?? 'unknown'}: ${lastDisconnect?.error?.message ?? 'no error'})`,
+        );
 
         // 515 right after a QR scan is WhatsApp's normal "restart the
-        // socket to finish logging in" signal — reconnect immediately.
+        // socket to finish logging in" signal — reconnect immediately
+        // WITHOUT wiping creds (allowPairing would delete the new session).
         if (statusCode === DisconnectReason.restartRequired) {
           this.logger.log(`Restarting session ${channelId} to finish login`);
-          setTimeout(() => this.startSession(tenantId, channelId, onMessage), 500);
+          setTimeout(
+            () =>
+              void this.startSession(tenantId, channelId, onMessage, {
+                allowPairing: false,
+              }),
+            1000,
+          );
           return;
         }
 
@@ -303,7 +321,13 @@ export class BaileysProvider {
         await this.channelService.updateStatus(channelId, 'disconnected');
         this.realtimeGateway.emitChannelStatus(tenantId, channelId, 'disconnected');
         if (shouldReconnect) {
-          setTimeout(() => this.startSession(tenantId, channelId, onMessage), 5000);
+          setTimeout(
+            () =>
+              void this.startSession(tenantId, channelId, onMessage, {
+                allowPairing: false,
+              }),
+            5000,
+          );
         } else if (!paired) {
           this.logger.log(
             `QR pairing for ${channelId} expired without a scan; stopping.`,
