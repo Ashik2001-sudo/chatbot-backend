@@ -46,6 +46,11 @@ export class BaileysProvider {
   private sessions = new Map<string, WASocket>();
   /** Channels shut down on purpose; suppresses the auto-reconnect. */
   private stopped = new Set<string>();
+  /** QR pairing in progress — a 515 close must resume, not wipe or skip. */
+  private freshPairings = new Set<string>();
+  private resumeAttempts = new Map<string, number>();
+  /** Reuse the WA Web version the QR was generated with. */
+  private cachedWaVersion?: [number, number, number];
   private groupMetaCache = new Map<string, GroupInfo & { fetchedAt: number }>();
   private historyDecisionHandlers = new Map<
     string,
@@ -166,9 +171,40 @@ export class BaileysProvider {
     lastDisconnect: { error?: Boom | Error } | undefined,
   ): number | undefined {
     const err = lastDisconnect?.error as
-      | (Boom & { status?: number })
+      | (Boom & { status?: number; data?: { attrs?: { code?: string } } })
       | undefined;
-    return err?.output?.statusCode ?? err?.status;
+    const fromAttrs = Number(err?.data?.attrs?.code);
+    return (
+      err?.output?.statusCode ??
+      err?.status ??
+      (Number.isFinite(fromAttrs) ? fromAttrs : undefined)
+    );
+  }
+
+  private isRestartRequired(
+    statusCode: number | undefined,
+    lastDisconnect: { error?: Boom | Error } | undefined,
+  ) {
+    if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+      return true;
+    }
+    const msg = lastDisconnect?.error?.message ?? '';
+    return /restart required/i.test(msg);
+  }
+
+  private async resolveWaVersion() {
+    if (this.cachedWaVersion) return this.cachedWaVersion;
+    try {
+      const waVersion = await fetchLatestWaWebVersion({});
+      this.cachedWaVersion = waVersion.version;
+      this.logger.log(`Using WhatsApp Web version v${waVersion.version.join('.')}`);
+      return this.cachedWaVersion;
+    } catch (err) {
+      this.logger.warn(
+        `Failed to fetch latest WhatsApp version: ${err instanceof Error ? err.message : err}`,
+      );
+      return undefined;
+    }
   }
 
   async setHistorySyncDecision(channelId: string, enabled: boolean) {
@@ -205,9 +241,10 @@ export class BaileysProvider {
     tenantId: string,
     channelId: string,
     onMessage: (data: Parameters<MessageService['createInbound']>[0]) => Promise<unknown>,
-    opts: { allowPairing?: boolean } = {},
+    opts: { allowPairing?: boolean; resume?: boolean } = {},
   ) {
-    const allowPairing = opts.allowPairing ?? true;
+    // Default false: a missing flag must never wipe a just-paired session.
+    const allowPairing = opts.allowPairing ?? false;
     this.stopped.delete(channelId);
 
     if (allowPairing) {
@@ -234,19 +271,37 @@ export class BaileysProvider {
     // Restoring an unpaired session would emit endless QR codes; only a
     // user-initiated connect is allowed to start the QR pairing flow.
     if (isNewPairing && !allowPairing) {
-      this.logger.warn(`Skipping unpaired session ${channelId} (no QR pairing requested)`);
+      if (opts.resume) {
+        const attempt = (this.resumeAttempts.get(channelId) ?? 0) + 1;
+        this.resumeAttempts.set(channelId, attempt);
+        if (attempt <= 5) {
+          this.logger.warn(
+            `Resume after QR pairing for ${channelId} but creds.me not on disk yet (attempt ${attempt}/5)`,
+          );
+          setTimeout(
+            () =>
+              void this.startSession(tenantId, channelId, onMessage, {
+                allowPairing: false,
+                resume: true,
+              }),
+            1000,
+          );
+          return;
+        }
+        this.resumeAttempts.delete(channelId);
+      }
+      this.logger.warn(
+        `Skipping unpaired session ${channelId} (no QR pairing requested, creds.json=${this.hasSavedSession(channelId)})`,
+      );
       await this.channelService.updateStatus(channelId, 'disconnected');
+      this.realtimeGateway.emitChannelStatus(tenantId, channelId, 'disconnected');
       return;
     }
+    this.resumeAttempts.delete(channelId);
 
-    let version: [number, number, number] | undefined;
-    try {
-      const waVersion = await fetchLatestWaWebVersion({});
-      version = waVersion.version;
-      this.logger.log(`Using WhatsApp Web version v${version.join('.')}`);
-    } catch (err) {
-      this.logger.warn(`Failed to fetch latest WhatsApp version: ${err instanceof Error ? err.message : err}`);
-    }
+    if (isNewPairing) this.freshPairings.add(channelId);
+
+    const version = await this.resolveWaVersion();
 
     const sock = makeWASocket({
       ...(version ? { version } : {}),
@@ -280,9 +335,13 @@ export class BaileysProvider {
       }
 
       if (connection === 'open') {
+        this.freshPairings.delete(channelId);
+        this.resumeAttempts.delete(channelId);
         await this.channelService.updateStatus(channelId, 'connected');
         this.realtimeGateway.emitChannelStatus(tenantId, channelId, 'connected');
-        this.logger.log(`Baileys connected: ${channelId}`);
+        this.logger.log(
+          `Baileys connected: ${channelId} as ${sock.user?.id ?? sock.authState.creds.me?.id}`,
+        );
         await this.backfillContactAvatars(channelId, sock);
       }
 
@@ -290,32 +349,52 @@ export class BaileysProvider {
         this.sessions.delete(channelId);
         // Intentional shutdown (channel deleted/disconnected by the admin):
         // skip the status update and never reconnect.
-        if (this.stopped.delete(channelId)) return;
+        if (this.stopped.delete(channelId)) {
+          this.freshPairings.delete(channelId);
+          return;
+        }
 
         const statusCode = this.disconnectStatusCode(lastDisconnect);
+        const paired = Boolean(sock.authState.creds.me);
+        const restartNeeded =
+          this.isRestartRequired(statusCode, lastDisconnect) ||
+          (paired &&
+            this.freshPairings.has(channelId) &&
+            statusCode !== DisconnectReason.loggedOut);
+
         this.logger.log(
-          `Baileys closed ${channelId} (code ${statusCode ?? 'unknown'}: ${lastDisconnect?.error?.message ?? 'no error'})`,
+          `Baileys closed ${channelId} (code ${statusCode ?? 'unknown'}: ${lastDisconnect?.error?.message ?? 'no error'}, paired=${paired}, restart=${restartNeeded})`,
         );
 
-        // 515 right after a QR scan is WhatsApp's normal "restart the
-        // socket to finish logging in" signal — reconnect immediately
-        // WITHOUT wiping creds (allowPairing would delete the new session).
-        if (statusCode === DisconnectReason.restartRequired) {
-          this.logger.log(`Restarting session ${channelId} to finish login`);
+        // 515 after a QR scan is WhatsApp telling us to reopen with the
+        // new credentials. Flush creds first and never wipe the session.
+        if (restartNeeded) {
+          try {
+            await saveCreds();
+          } catch (e) {
+            this.logger.warn(
+              `Could not flush creds before restart: ${e instanceof Error ? e.message : e}`,
+            );
+          }
+          this.logger.log(
+            `Restarting session ${channelId} to finish login (me=${sock.authState.creds.me?.id ?? 'pending'})`,
+          );
           setTimeout(
             () =>
               void this.startSession(tenantId, channelId, onMessage, {
                 allowPairing: false,
+                resume: true,
               }),
-            1000,
+            500,
           );
           return;
         }
 
+        this.freshPairings.delete(channelId);
+
         // Only paired sessions may auto-reconnect. An unpaired session
         // closing means the QR was never scanned (timeout) — restarting it
         // would emit fresh QR codes in an endless loop.
-        const paired = Boolean(sock.authState.creds.me);
         const shouldReconnect =
           paired && statusCode !== DisconnectReason.loggedOut;
         await this.channelService.updateStatus(channelId, 'disconnected');
@@ -757,6 +836,8 @@ export class BaileysProvider {
   disconnect(channelId: string) {
     // Mark as intentionally stopped so the close handler doesn't reconnect.
     this.stopped.add(channelId);
+    this.freshPairings.delete(channelId);
+    this.resumeAttempts.delete(channelId);
     const sock = this.sessions.get(channelId);
     this.historyDecisionHandlers.delete(channelId);
     this.historyStates.delete(channelId);
