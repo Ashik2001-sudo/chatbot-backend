@@ -44,8 +44,13 @@ interface HistorySyncState {
 export class BaileysProvider {
   private readonly logger = new Logger(BaileysProvider.name);
   private sessions = new Map<string, WASocket>();
-  /** Channels shut down on purpose; suppresses the auto-reconnect. */
-  private stopped = new Set<string>();
+  /**
+   * Sockets closed by us (disconnect / new QR). Close on these must not
+   * auto-reconnect. Channel-level flags are wrong here: starting a QR
+   * session calls disconnect() first, and that flag would also swallow
+   * the 515 restart after a successful scan.
+   */
+  private intentionalClose = new Set<WASocket>();
   /** QR pairing in progress — a 515 close must resume, not wipe or skip. */
   private freshPairings = new Set<string>();
   private resumeAttempts = new Map<string, number>();
@@ -245,7 +250,6 @@ export class BaileysProvider {
   ) {
     // Default false: a missing flag must never wipe a just-paired session.
     const allowPairing = opts.allowPairing ?? false;
-    this.stopped.delete(channelId);
 
     if (allowPairing) {
       // Disconnect any existing session for this channel before creating a new socket
@@ -347,10 +351,9 @@ export class BaileysProvider {
 
       if (connection === 'close') {
         this.sessions.delete(channelId);
-        // Intentional shutdown (channel deleted/disconnected by the admin):
-        // skip the status update and never reconnect.
-        if (this.stopped.delete(channelId)) {
+        if (this.intentionalClose.delete(sock)) {
           this.freshPairings.delete(channelId);
+          this.logger.log(`Baileys ${channelId} closed on purpose; not reconnecting`);
           return;
         }
 
@@ -834,15 +837,14 @@ export class BaileysProvider {
   }
 
   disconnect(channelId: string) {
-    // Mark as intentionally stopped so the close handler doesn't reconnect.
-    this.stopped.add(channelId);
-    this.freshPairings.delete(channelId);
-    this.resumeAttempts.delete(channelId);
     const sock = this.sessions.get(channelId);
     this.historyDecisionHandlers.delete(channelId);
     this.historyStates.delete(channelId);
     this.contactNames.delete(channelId);
+    this.freshPairings.delete(channelId);
+    this.resumeAttempts.delete(channelId);
     if (sock) {
+      this.intentionalClose.add(sock);
       sock.end(undefined);
       this.sessions.delete(channelId);
     }
