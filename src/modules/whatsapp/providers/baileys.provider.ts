@@ -1,7 +1,9 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import makeWASocket, {
+  Browsers,
   Contact as WAContact,
   DisconnectReason,
+  fetchLatestWaWebVersion,
   useMultiFileAuthState,
   WASocket,
   WAMessage,
@@ -198,6 +200,22 @@ export class BaileysProvider {
   ) {
     const allowPairing = opts.allowPairing ?? true;
     this.stopped.delete(channelId);
+
+    if (allowPairing) {
+      // Disconnect any existing session for this channel before creating a new socket
+      this.disconnect(channelId);
+
+      // Clean up old session files so Baileys is forced to generate a fresh QR code
+      const dir = join(process.cwd(), 'sessions', channelId);
+      if (existsSync(dir)) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch (e) {
+          this.logger.warn(`Could not clear auth dir ${dir}: ${e}`);
+        }
+      }
+    }
+
     const authDir = this.getAuthDir(channelId);
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     // creds.me is only set once QR pairing succeeded (creds.registered is
@@ -212,7 +230,18 @@ export class BaileysProvider {
       return;
     }
 
+    let version: [number, number, number] | undefined;
+    try {
+      const waVersion = await fetchLatestWaWebVersion({});
+      version = waVersion.version;
+      this.logger.log(`Using WhatsApp Web version v${version.join('.')}`);
+    } catch (err) {
+      this.logger.warn(`Failed to fetch latest WhatsApp version: ${err instanceof Error ? err.message : err}`);
+    }
+
     const sock = makeWASocket({
+      ...(version ? { version } : {}),
+      browser: Browsers.ubuntu('Chrome'),
       auth: state,
       printQRInTerminal: false,
       // Ask the phone for full chat history when the device is (re)linked.
